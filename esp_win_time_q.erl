@@ -17,22 +17,24 @@
    every,
    period,
    window,
+   ts_list = [], %% list of inserted Timestamps
    at,
-   mark
+   mark,
+   fill_period
 }).
 
 options() ->
-   [{period, binary}, {every, binary}].
+   [{period, binary}, {every, binary}, {fill_period, is_set}].
 
-init(NodeId, _Inputs, #{period := Period, every := Every} = Params) ->
+init(NodeId, _Inputs, #{period := Period, every := Every, fill_period := Fill} = Params) ->
    io:format("~p init:node ~p~n",[NodeId, Params]),
    Ev = faxe_time:duration_to_ms(Every),
    Per = faxe_time:duration_to_ms(Period),
-   State = #state{period = Per, every = Ev},
+   State = #state{period = Per, every = Ev, fill_period = Fill, window = queue:new()},
    {ok, all, State}.
 
 
-process(_Inport, #data_point{ts = Ts} = Point, State=#state{} ) ->
+process(_Inport, #data_point{} = Point, State=#state{} ) ->
    State1 = tick(State),
    NewState = accumulate(Point, State1),
    {ok, NewState}.
@@ -47,40 +49,45 @@ handle_info(Request, State) ->
 
 accumulate(Point = #data_point{ts = Ts}, State = #state{mark = undefined}) ->
    accumulate(Point, State#state{mark = Ts});
-accumulate(Point = #data_point{ts = Ts}, State = #state{window = Win}) ->
-   State#state{at = Ts, window = queue:in(Point, Win)}.
+accumulate(Point = #data_point{ts = Ts}, State = #state{window = Win, ts_list = TsList}) ->
+   State#state{at = Ts, ts_list = TsList++[Ts], window = queue:in(Point, Win)}.
 
 tick(State = #state{mark = undefined}) ->
    State;
-tick(State = #state{mark = Mark, at = At, window = Win, period = Interval, every = Every}) ->
-   ok;
-
-%% tick the window
-tick(State = #esp_window{stats = #esp_win_stats{events = {[],[],[]} } }) ->
-   State;
-tick(State = #esp_window{agg_mod = _Module, agg = _Agg, every = Every, agg_fields = _Field,
-   stats = #esp_win_stats{events = {_TimeStamps, _Values, _E} = Events, at = At, mark = Mark} = Stats, period = Interval}) ->
-
-   % on a tick, we check for sliding out old events
-   {{Tss, _Vs, Es}=Keep, _Evict} = evict(Events, At, Interval),
-   NewAt = lists:last(Tss),
-%%   lager:notice("on tick timespan is ~p | At-Mark is: ~p | AT : ~p",[NewAt-hd(Tss), NewAt-Mark, faxe_time:to_date(NewAt)]),
-   case (NewAt - Mark) >= Every of
-      true -> %{ok, Res, AggS} = Module:emit(Stats, NewAgg),
-%%         Res = c_agg:call({Tss, Vs}, Module, Agg, Field),
-         Batch = #data_batch{points = Es},
-%%         lager:warning("~n when ~p ~p emitting: ~p",[NewAt-Mark, ?MODULE, {Batch, length(Batch#data_batch.points)}]),
+tick(State = #state{mark = Mark, at = At, window = Win, period = Interval, every = Every, ts_list = TsList, fill_period = Fill}) ->
+   {KeepTsList, NewWindow} = evict(TsList, Win, At, Interval),
+   NewAt = lists:last(KeepTsList),
+   WindowLength = NewAt - hd(KeepTsList),
+   lager:notice("window-Length: ~p~n",[WindowLength]),
+%%   CurrentLen = NewAt - Interval,
+%%   LenDiff = CurrentLen,
+   case check_emit(NewAt, Mark, Every, Fill, hd(KeepTsList), Interval) of
+      true ->
+         Batch = #data_batch{points = queue:to_list(NewWindow)},
+         lager:warning("~n when ~p period: ~p emitting: ~p",[NewAt-Mark, Interval, length(Batch#data_batch.points)]),
          dataflow:emit(Batch),
-         State#esp_window{stats = Stats#esp_win_stats{events = Keep, mark = NewAt, at = NewAt}};
+         State#state{mark = NewAt, at = NewAt, window = NewWindow, ts_list = KeepTsList};
       false ->
-         State#esp_window{stats = Stats#esp_win_stats{events = Keep, at = NewAt}}
+         State#state{window = NewWindow, ts_list = KeepTsList, at = NewAt}
    end.
 
-%%%% filter list and evict old entries, with early abandoning
--spec evict(window_events(), non_neg_integer(), non_neg_integer()) -> {window_events(), list()}.
-evict({Ts, Vals, Events}, At, Interval) ->
-   {Keep, Evict} = win_util:split(Ts, At - Interval),
-%%   lager:info("Evicted: ~p",[Evict]),
-   { {Keep,  win_util:sync(Vals, Evict), win_util:sync(Events, Evict)},  Evict}
-.
+evict(TimestampList, Window, At, Interval) ->
+   {KeepTimestamps, Evict} = win_util:split(TimestampList, At - Interval),
+   lager:info("evict: ~p~n keep: ~p",[[faxe_time:to_date(E) || E <- Evict], [faxe_time:to_date(T) || T <- KeepTimestamps]]),
+   {KeepTimestamps, win_util:sync_q(Window, Evict)}.
+
+
+check_emit(At, Mark, Every, Fill, FirstTime, Period) ->
+   case (At - Mark) >= Every of
+      true ->
+         case Fill of
+            true -> is_window_full(At, FirstTime, Period);
+            false -> true
+         end;
+      false -> false
+   end.
+
+is_window_full(LastTime, FirstTime, Period) ->
+   LastTime - FirstTime >= Period.
+
 
