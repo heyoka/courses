@@ -3,6 +3,7 @@
 %% @doc window which refers it's timing to the timestamp contained in the incoming data-items
 %% rewrite with queue module instead of lists
 %% @todo setup timeout where points get evicted even though there a timestamps missing ?
+%%
 -module(esp_win_time_q).
 -author("Alexander Minichmair").
 
@@ -20,7 +21,8 @@
    ts_list = [], %% list of inserted Timestamps
    at,
    mark,
-   fill_period
+   fill_period,
+   has_emitted = false %% false as long as the window never has emitted values
 }).
 
 options() ->
@@ -30,7 +32,9 @@ init(NodeId, _Inputs, #{period := Period, every := Every, fill_period := Fill} =
    io:format("~p init:node ~p~n",[NodeId, Params]),
    Ev = faxe_time:duration_to_ms(Every),
    Per = faxe_time:duration_to_ms(Period),
-   State = #state{period = Per, every = Ev, fill_period = Fill, window = queue:new()},
+   %% fill_period does not make sense, if every is less than period
+   DoFill = (Fill == true) andalso (Per > Ev),
+   State = #state{period = Per, every = Ev, fill_period = DoFill, window = queue:new()},
    {ok, all, State}.
 
 
@@ -54,40 +58,34 @@ accumulate(Point = #data_point{ts = Ts}, State = #state{window = Win, ts_list = 
 
 tick(State = #state{mark = undefined}) ->
    State;
-tick(State = #state{mark = Mark, at = At, window = Win, period = Interval, every = Every, ts_list = TsList, fill_period = Fill}) ->
-   {KeepTsList, NewWindow} = evict(TsList, Win, At, Interval),
+tick(State = #state{mark = Mark, at = At, window = Win, period = Interval,
+      every = Every, ts_list = TsList, fill_period = Fill}) ->
+
+   {KeepTsList, NewWindow, HasEvicted} = evict(TsList, Win, At, Interval),
    NewAt = lists:last(KeepTsList),
-   WindowLength = NewAt - hd(KeepTsList),
-   lager:notice("window-Length: ~p~n",[WindowLength]),
-%%   CurrentLen = NewAt - Interval,
-%%   LenDiff = CurrentLen,
-   case check_emit(NewAt, Mark, Every, Fill, hd(KeepTsList), Interval) of
+   case check_emit(NewAt, Mark, Every, Fill, (HasEvicted orelse State#state.has_emitted)) of
       true ->
          Batch = #data_batch{points = queue:to_list(NewWindow)},
          lager:warning("~n when ~p period: ~p emitting: ~p",[NewAt-Mark, Interval, length(Batch#data_batch.points)]),
          dataflow:emit(Batch),
-         State#state{mark = NewAt, at = NewAt, window = NewWindow, ts_list = KeepTsList};
+         State#state{mark = NewAt, at = NewAt, window = NewWindow, ts_list = KeepTsList, has_emitted = true};
       false ->
          State#state{window = NewWindow, ts_list = KeepTsList, at = NewAt}
    end.
 
 evict(TimestampList, Window, At, Interval) ->
    {KeepTimestamps, Evict} = win_util:split(TimestampList, At - Interval),
-   lager:info("evict: ~p~n keep: ~p",[[faxe_time:to_date(E) || E <- Evict], [faxe_time:to_date(T) || T <- KeepTimestamps]]),
-   {KeepTimestamps, win_util:sync_q(Window, Evict)}.
+   lager:info("evict: [~p] ~p~n keep [~p]: ~p",[length(Evict), [faxe_time:to_date(E) || E <- Evict],
+      length(KeepTimestamps), [faxe_time:to_date(T) || T <- KeepTimestamps]]),
+   {KeepTimestamps, win_util:sync_q(Window, Evict), length(Evict) > 0}.
 
 
-check_emit(At, Mark, Every, Fill, FirstTime, Period) ->
-   case (At - Mark) >= Every of
-      true ->
-         case Fill of
-            true -> is_window_full(At, FirstTime, Period);
-            false -> true
-         end;
+check_emit(At, Mark, Every, Fill, EvictedOrEmitted) ->
+   case At - Mark >= Every of
+      true -> case Fill of
+                 true -> EvictedOrEmitted;
+                 false -> true
+              end;
       false -> false
    end.
-
-is_window_full(LastTime, FirstTime, Period) ->
-   LastTime - FirstTime >= Period.
-
 

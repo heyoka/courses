@@ -1,0 +1,12 @@
+var in =
+    |value_emitter()
+    .every(1s)
+    .type(point)
+    %.align()
+
+in
+    |win_clock_new()
+    .every(5s)
+    .period(15s)
+    .fill_period()
+    .align()
